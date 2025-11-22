@@ -1,8 +1,9 @@
 import fs from 'fs/promises';
 import AdmZip from 'adm-zip';
 import path from 'path';
-import { spawn } from 'child_process';
 import logger from '../utils/logger.js';
+import config from '../config/config.js';
+import crypto from 'crypto';
 
 const ACCOUNTS_FILE = path.join(process.cwd(), 'data', 'accounts.json');
 
@@ -55,56 +56,48 @@ export async function toggleAccount(index, enable) {
 }
 
 // 触发登录流程
-export async function triggerLogin() {
-  return new Promise((resolve, reject) => {
-    logger.info('启动登录流程...');
+export async function triggerLogin(customRedirectUri = null, customState = null) {
+  logger.info('生成 Google OAuth 授权 URL...');
 
-    const loginScript = path.join(process.cwd(), 'scripts', 'oauth-server.js');
-    const child = spawn('node', [loginScript], {
-      stdio: 'pipe',
-      shell: true
-    });
+  // 检查 OAuth 配置
+  if (!config.oauth || !config.oauth.clientId) {
+    throw new Error('OAuth 配置未设置，请在系统设置中配置 Google OAuth');
+  }
 
-    let authUrl = '';
-    let output = '';
+  const clientId = config.oauth.clientId;
+  // 如果提供了自定义 redirect_uri，使用它；否则使用默认值
+  const redirectUri = customRedirectUri || 'http://localhost:8099/oauth-callback';
+  // 如果提供了自定义 state（包含用户信息），使用它；否则生成随机 UUID
+  const state = customState || crypto.randomUUID();
+  const scopes = [
+    'https://www.googleapis.com/auth/cloud-platform',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+    'https://www.googleapis.com/auth/cclog',
+    'https://www.googleapis.com/auth/experimentsandconfigs'
+  ];
 
-    child.stdout.on('data', (data) => {
-      const text = data.toString();
-      output += text;
-
-      // 提取授权 URL
-      const urlMatch = text.match(/(https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?[^\s]+)/);
-      if (urlMatch) {
-        authUrl = urlMatch[1];
-      }
-
-      logger.info(text.trim());
-    });
-
-    child.stderr.on('data', (data) => {
-      logger.error(data.toString().trim());
-    });
-
-    child.on('close', (code) => {
-      if (code === 0) {
-        logger.info('登录流程完成');
-        resolve({ success: true, authUrl, message: '登录成功' });
-      } else {
-        reject(new Error('登录流程失败'));
-      }
-    });
-
-    // 5 秒后返回授权 URL，不等待完成
-    setTimeout(() => {
-      if (authUrl) {
-        resolve({ success: true, authUrl, message: '请在浏览器中完成授权' });
-      }
-    }, 5000);
-
-    child.on('error', (error) => {
-      reject(error);
-    });
+  const params = new URLSearchParams({
+    access_type: 'offline',
+    client_id: clientId,
+    prompt: 'consent',
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: scopes.join(' '),
+    state: state
   });
+
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+
+  logger.info('授权 URL 已生成');
+  logger.info('注意：需要在 Google Cloud Console 中添加重定向 URI: ' + redirectUri);
+
+  return {
+    success: true,
+    authUrl,
+    redirectUri, // 返回实际使用的 redirect_uri
+    message: '请在浏览器中完成 Google 授权'
+  };
 }
 
 // 获取账号统计信息

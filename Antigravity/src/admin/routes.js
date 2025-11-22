@@ -170,11 +170,31 @@ router.get('/verify', (req, res) => {
 // Google OAuth 回调接口（不需要认证）
 router.get('/oauth-callback', async (req, res) => {
   try {
-    const { code } = req.query;
+    const { code, state } = req.query;
 
     if (!code) {
       await addLog('error', 'OAuth 回调失败：未收到授权码');
       return res.status(400).send('<h1>授权失败</h1><p>未收到授权码</p>');
+    }
+
+    // 解析 state 参数，判断是管理员还是用户
+    let stateData = null;
+    let isUserAuth = false;
+    let userId = null;
+
+    if (state) {
+      try {
+        const stateStr = Buffer.from(state, 'base64').toString('utf-8');
+        stateData = JSON.parse(stateStr);
+        if (stateData.type === 'user' && stateData.userId) {
+          isUserAuth = true;
+          userId = stateData.userId;
+          await addLog('info', `用户 ${userId} 触发的 OAuth 回调`);
+        }
+      } catch (e) {
+        // state 解析失败，按照管理员流程处理
+        await addLog('warn', 'state 参数解析失败，按照管理员流程处理');
+      }
     }
 
     // 记录回调信息
@@ -227,27 +247,74 @@ router.get('/oauth-callback', async (req, res) => {
 
     await addLog('success', '成功交换 Google OAuth Token');
 
-    // 保存 Token 到 accounts.json
-    const account = {
-      access_token: tokenData.access_token,
-      refresh_token: tokenData.refresh_token,
-      expires_in: tokenData.expires_in,
-      timestamp: Date.now()
-    };
-
-    const accountsFile = './data/accounts.json';
-    let accounts = [];
+    // 获取用户邮箱信息
+    let userEmail = null;
     try {
-      const fsPromises = await import('fs/promises');
-      const data = await fsPromises.readFile(accountsFile, 'utf-8');
-      accounts = JSON.parse(data);
-    } catch {
-      // 文件不存在，使用空数组
+      const userInfo = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: 'www.googleapis.com',
+          path: '/oauth2/v2/userinfo',
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${tokenData.access_token}`
+          }
+        };
+
+        const request = https.request(options, (response) => {
+          let body = '';
+          response.on('data', chunk => body += chunk);
+          response.on('end', () => {
+            if (response.statusCode === 200) {
+              resolve(JSON.parse(body));
+            } else {
+              reject(new Error('获取用户信息失败'));
+            }
+          });
+        });
+
+        request.on('error', reject);
+        request.end();
+      });
+
+      userEmail = userInfo.email;
+    } catch (e) {
+      // 忽略错误
     }
-    accounts.push(account);
-    const fsPromises = await import('fs/promises');
-    await fsPromises.writeFile(accountsFile, JSON.stringify(accounts, null, 2));
-    await addLog('success', 'Token 已保存到 accounts.json');
+
+    // 根据 isUserAuth 决定保存位置
+    if (isUserAuth && userId) {
+      // 保存到用户个人的 Token 列表
+      await addUserToken(userId, {
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token,
+        expires_in: tokenData.expires_in,
+        email: userEmail
+      });
+
+      await addLog('success', `Token 已保存到用户 ${userId} 的账号列表`);
+    } else {
+      // 保存到管理员的 accounts.json（系统级共享池）
+      const account = {
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token,
+        expires_in: tokenData.expires_in,
+        timestamp: Date.now()
+      };
+
+      const accountsFile = './data/accounts.json';
+      let accounts = [];
+      try {
+        const fsPromises = await import('fs/promises');
+        const data = await fsPromises.readFile(accountsFile, 'utf-8');
+        accounts = JSON.parse(data);
+      } catch {
+        // 文件不存在，使用空数组
+      }
+      accounts.push(account);
+      const fsPromises = await import('fs/promises');
+      await fsPromises.writeFile(accountsFile, JSON.stringify(accounts, null, 2));
+      await addLog('success', 'Token 已保存到 accounts.json（系统共享池）');
+    }
 
     // 返回成功页面，显示 Token 信息
     res.send(`
@@ -358,8 +425,7 @@ router.get('/oauth-callback', async (req, res) => {
 
           <p class="note">Token 已自动保存到系统，你也可以手动复制备用</p>
           <div class="btn-group">
-            <button class="main-btn" onclick="window.location.href='/'">返回管理后台</button>
-            <button class="secondary-btn" onclick="window.location.href='/user.html'">返回用户中心</button>
+            <button class="main-btn" onclick="goBack()">返回</button>
           </div>
         </div>
         <script>
@@ -369,6 +435,22 @@ router.get('/oauth-callback', async (req, res) => {
               alert('已复制到剪贴板');
             });
           }
+
+          // 智能返回：检测来源并返回到正确的页面
+          function goBack() {
+            // 根据是否为用户认证决定返回页面
+            const isUser = ${isUserAuth ? 'true' : 'false'};
+            if (isUser) {
+              window.location.href = window.location.origin + '/user.html';
+            } else {
+              window.location.href = window.location.origin + '/';
+            }
+          }
+
+          // 3秒后自动返回
+          setTimeout(function() {
+            goBack();
+          }, 3000);
         </script>
       </body>
       </html>
@@ -953,10 +1035,23 @@ router.get('/user/tokens', userAuth, async (req, res) => {
   }
 });
 
-// 用户触发 Google OAuth 登录流程
+// 用户触发 Google OAuth 登录流程（需要认证，使用加密 state 参数标识用户）
 router.post('/user/tokens/login', userAuth, async (req, res) => {
   try {
-    const result = await triggerLogin();
+    // 使用当前请求的域名生成动态 redirect_uri
+    const protocol = req.protocol;
+    const host = req.get('host');
+    const redirectUri = `${protocol}://${host}/admin/oauth-callback`;
+
+    // 生成加密的 state，包含用户 ID
+    const stateData = {
+      userId: req.userId,
+      timestamp: Date.now(),
+      type: 'user'
+    };
+    const stateStr = Buffer.from(JSON.stringify(stateData)).toString('base64');
+
+    const result = await triggerLogin(redirectUri, stateStr);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1130,6 +1225,157 @@ router.patch('/user/tokens/:index/sharing', userAuth, async (req, res) => {
     res.json(result);
   } catch (error) {
     await addLog('error', `更新 Token 共享设置失败: ${error.message}`);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// 用户批量导出 Token
+router.post('/user/tokens/export', userAuth, async (req, res) => {
+  try {
+    const { indices } = req.body;
+    const tokens = await getUserTokens(req.userId);
+    const exportData = [];
+
+    for (const index of indices) {
+      if (index >= 0 && index < tokens.length) {
+        const token = tokens[index];
+        exportData.push({
+          email: token.email || 'Unknown',
+          access_token: token.access_token,
+          refresh_token: token.refresh_token,
+          expires_in: token.expires_in,
+          timestamp: token.timestamp,
+          enable: token.enable !== false,
+          isShared: token.isShared || false,
+          dailyLimit: token.dailyLimit || 100
+        });
+      }
+    }
+
+    await addLog('info', `用户导出了 ${exportData.length} 个 Token`);
+
+    const archiver = (await import('archiver')).default;
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const timestamp = new Date().toISOString().split('T')[0];
+
+    res.attachment(`user_tokens_export_${timestamp}.zip`);
+    res.setHeader('Content-Type', 'application/zip');
+
+    archive.pipe(res);
+    archive.append(JSON.stringify(exportData, null, 2), { name: 'tokens.json' });
+    await archive.finalize();
+  } catch (error) {
+    await addLog('error', `用户导出 Token 失败: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 用户批量导入 Token
+router.post('/user/tokens/import', userAuth, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: '请上传文件' });
+    }
+
+    await addLog('info', '用户正在导入 Token...');
+
+    const AdmZip = (await import('adm-zip')).default;
+    const zip = new AdmZip(req.file.path);
+    const zipEntries = zip.getEntries();
+
+    const tokensEntry = zipEntries.find(entry => entry.entryName === 'tokens.json');
+    if (!tokensEntry) {
+      throw new Error('ZIP 文件中没有找到 tokens.json');
+    }
+
+    const tokensContent = tokensEntry.getData().toString('utf8');
+    const importedTokens = JSON.parse(tokensContent);
+
+    if (!Array.isArray(importedTokens)) {
+      throw new Error('tokens.json 格式错误：应该是一个数组');
+    }
+
+    const currentTokens = await getUserTokens(req.userId);
+    let addedCount = 0;
+
+    for (const token of importedTokens) {
+      const exists = currentTokens.some(t => t.access_token === token.access_token);
+      if (!exists) {
+        await addUserToken(req.userId, {
+          access_token: token.access_token,
+          refresh_token: token.refresh_token,
+          expires_in: token.expires_in,
+          email: token.email
+        });
+
+        if (token.isShared) {
+          const tokens = await getUserTokens(req.userId);
+          const newIndex = tokens.length - 1;
+          await updateTokenSharing(req.userId, newIndex, {
+            isShared: token.isShared,
+            dailyLimit: token.dailyLimit || 100
+          });
+        }
+
+        addedCount++;
+      }
+    }
+
+    // 清理上传的文件
+    try {
+      const fsPromises = await import('fs/promises');
+      await fsPromises.unlink(req.file.path);
+    } catch (e) {
+      console.error('清理上传文件失败:', e);
+    }
+
+    await addLog('success', `用户成功导入 ${addedCount} 个 Token`);
+    res.json({
+      success: true,
+      count: addedCount,
+      total: importedTokens.length,
+      skipped: importedTokens.length - addedCount,
+      message: `成功导入 ${addedCount} 个 Token${importedTokens.length - addedCount > 0 ? `，跳过 ${importedTokens.length - addedCount} 个重复账号` : ''}`
+    });
+  } catch (error) {
+    await addLog('error', `用户导入 Token 失败: ${error.message}`);
+    // 清理上传的文件
+    try {
+      const fsPromises = await import('fs/promises');
+      await fsPromises.unlink(req.file.path);
+    } catch (e) {}
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 用户切换 Token 启用/禁用
+router.patch('/user/tokens/:index/toggle', userAuth, async (req, res) => {
+  try {
+    const { index } = req.params;
+    const tokenIndex = parseInt(index);
+    const { enable } = req.body;
+
+    if (isNaN(tokenIndex)) {
+      return res.status(400).json({ error: '无效的索引' });
+    }
+
+    const tokens = await getUserTokens(req.userId);
+    if (tokenIndex < 0 || tokenIndex >= tokens.length) {
+      return res.status(400).json({ error: '无效的索引' });
+    }
+
+    tokens[tokenIndex].enable = enable;
+
+    // 保存用户数据
+    const user = await getUserById(req.userId);
+    user.googleTokens = tokens;
+    const { updateUser: saveUser } = await import('./user_manager.js');
+    await saveUser(req.userId, { googleTokens: tokens });
+
+    await addLog('info', `用户${enable ? '启用' : '禁用'}了 Token #${tokenIndex}`);
+    res.json({ success: true });
+  } catch (error) {
+    await addLog('error', `用户切换 Token 状态失败: ${error.message}`);
     res.status(400).json({ error: error.message });
   }
 });
