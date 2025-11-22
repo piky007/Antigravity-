@@ -1,11 +1,22 @@
 import tokenManager from '../auth/token_manager.js';
 import config from '../config/config.js';
+import { getUserOrSharedToken } from '../admin/user_manager.js';
 
-export async function generateAssistantResponse(requestBody, callback) {
-  const token = await tokenManager.getToken();
-  
-  if (!token) {
-    throw new Error('没有可用的token，请运行 npm run login 获取token');
+export async function generateAssistantResponse(requestBody, tokenSource, callback) {
+  let token;
+
+  if (tokenSource && tokenSource.type === 'user') {
+    // 用户 API Key - 使用用户自己的 Token 或共享 Token
+    token = await getUserOrSharedToken(tokenSource.userId);
+    if (!token) {
+      throw new Error('没有可用的 Token。请在用户中心添加 Google Token 或使用共享 Token');
+    }
+  } else {
+    // 管理员密钥 - 使用管理员 Token 池
+    token = await tokenManager.getToken();
+    if (!token) {
+      throw new Error('没有可用的token，请运行 npm run login 获取token');
+    }
   }
   
   const url = config.api.url;
@@ -91,11 +102,21 @@ export async function generateAssistantResponse(requestBody, callback) {
   }
 }
 
-export async function getAvailableModels() {
-  const token = await tokenManager.getToken();
-  
-  if (!token) {
-    throw new Error('没有可用的token，请运行 npm run login 获取token');
+export async function getAvailableModels(tokenSource) {
+  let token;
+
+  if (tokenSource && tokenSource.type === 'user') {
+    // 用户 API Key - 使用用户自己的 Token 或共享 Token
+    token = await getUserOrSharedToken(tokenSource.userId);
+    if (!token) {
+      throw new Error('没有可用的 Token。请在用户中心添加 Google Token 或使用共享 Token');
+    }
+  } else {
+    // 管理员密钥 - 使用管理员 Token 池
+    token = await tokenManager.getToken();
+    if (!token) {
+      throw new Error('没有可用的token，请运行 npm run login 获取token');
+    }
   }
   
   const response = await fetch(config.api.modelsUrl, {
