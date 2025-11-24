@@ -5,6 +5,8 @@
 测试地址
 https://ggt333.zeabur.app/user.html
 
+工具调用功能有问题，可能是google更改了数据流格式。
+
 ## ✨ 核心功能
 
 ### API 代理
